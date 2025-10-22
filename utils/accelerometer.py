@@ -1,6 +1,9 @@
+import os
 import random
 from typing import Dict, Any
 # from smbus2 import SMBus
+
+MOCK_ACC = os.getenv("MOCK_ACC", "1") in {"1", "true", "True", "yes", "YES"}
 
 def read_word_2c(bus, addr, reg):
     high = bus.read_byte_data(addr, reg)
@@ -11,45 +14,46 @@ def read_word_2c(bus, addr, reg):
     return val
 
 def read_acelerometer(dados):
-    # MPU_ADDR = 0x68
-    # PWR_MGMT_1 = 0x6B
-    # ACCEL_XOUT_H = 0x3B
-    # GYRO_XOUT_H  = 0x43
+    if not MOCK_ACC:
+        from smbus2 import SMBus 
+        MPU_ADDR = 0x68
+        PWR_MGMT_1 = 0x6B
+        ACCEL_XOUT_H = 0x3B
+        GYRO_XOUT_H  = 0x43
 
-    # with SMBus(1) as bus:
-    #     # Acorda o sensor, se necessário
-    #     bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0)
+        with SMBus(1) as bus:
+            # Acorda o sensor, se necessário
+            bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0)
 
-    #     # Lê valores brutos do acelerômetro
-    #     acc_x_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H)
-    #     acc_y_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H + 2)
-    #     acc_z_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H + 4)
+            # Lê valores brutos do acelerômetro
+            acc_x_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H)
+            acc_y_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H + 2)
+            acc_z_raw = read_word_2c(bus, MPU_ADDR, ACCEL_XOUT_H + 4)
 
-    #     # Lê valores brutos do giroscópio
-    #     gyro_x_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H)
-    #     gyro_y_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H + 2)
-    #     gyro_z_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H + 4)
+            # Lê valores brutos do giroscópio
+            gyro_x_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H)
+            gyro_y_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H + 2)
+            gyro_z_raw = read_word_2c(bus, MPU_ADDR, GYRO_XOUT_H + 4)
 
-    # # Converte acelerômetro para g (±2g → 16384 LSB/g)
-    # acc_x = acc_x_raw / 16384.0
-    # acc_y = acc_y_raw / 16384.0
-    # acc_z = acc_z_raw / 16384.0
+        # Converte acelerômetro para g (±2g → 16384 LSB/g)
+        acc_x = acc_x_raw / 16384.0
+        acc_y = acc_y_raw / 16384.0
+        acc_z = acc_z_raw / 16384.0
 
-    # # Converte giroscópio para °/s (±250°/s → 131 LSB/°/s)
-    # gyro_x = gyro_x_raw / 131.0
-    # gyro_y = gyro_y_raw / 131.0
-    # gyro_z = gyro_z_raw / 131.0
+        # Converte giroscópio para °/s (±250°/s → 131 LSB/°/s)
+        gyro_x = gyro_x_raw / 131.0
+        gyro_y = gyro_y_raw / 131.0
+        gyro_z = gyro_z_raw / 131.0
 
-    # # Atualiza o dicionário
-    # dados["accel_x"] = acc_x
-    # dados["accel_y"] = acc_y
-    # dados["accel_z"] = acc_z
-    # dados["gyro_x"] = gyro_x
-    # dados["gyro_y"] = gyro_y
-    # dados["gyro_z"] = gyro_z
+        # Atualiza o dicionário
+        dados["accel_x"] = acc_x
+        dados["accel_y"] = acc_y
+        dados["accel_z"] = acc_z
+        dados["gyro_x"] = gyro_x
+        dados["gyro_y"] = gyro_y
+        dados["gyro_z"] = gyro_z
 
-    # return dados
-    pass
+        return dados
 
 def calculate_heading(dados, delta_t=1.0):
     """
@@ -79,12 +83,13 @@ def calculate_heading(dados, delta_t=1.0):
 
     return direcao
 
-def mock_acelerometer(raw: Dict[str, Any]) -> Dict[str, Any]:
-    # Sem vírgulas ao fim das linhas (evita tuplas!), e retornando o dict
+# substitua sua função atual por esta
+def mock_acelerometer(raw: dict) -> dict:
+    # sem vírgulas no final (senão vira tuple)
     raw["accel_x"] = random.uniform(-0.5, 0.5)
     raw["accel_y"] = random.uniform(-0.5, 0.5)
     raw["accel_z"] = random.uniform(9.5, 10.5)
-    raw["gyro_x"]  = random.uniform(-5, 5)   # graus/s
-    raw["gyro_y"]  = random.uniform(-5, 5)   # graus/s
-    raw["gyro_z"]  = random.uniform(-5, 5)   # graus/s
+    raw["gyro_x"] = random.uniform(-5, 5)   # graus/s
+    raw["gyro_y"] = random.uniform(-5, 5)   # graus/s
+    raw["gyro_z"] = random.uniform(-5, 5)   # graus/s
     return raw
