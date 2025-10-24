@@ -74,7 +74,7 @@ class MMCloud:
         """Calcula o limiar de detecção de outliers com base na média e desvio padrão incremental"""
         if self.n_distances > 1:
             std_distance = (self.variance_distance / (self.n_distances - 1)) ** 0.5  # Desvio padrão
-            return self.mean_distance + 2.67 * std_distance  # Limiar dinâmico
+            return self.mean_distance + 2.0 * std_distance  # Limiar dinâmico
         else:
             return np.inf  # No início, não consideramos nenhum ponto como outlier
 
@@ -82,7 +82,7 @@ class MMCloud:
         """Calcula o limiar de dispersão com base na média e desvio padrão incremental"""
         if self.n_distances > 1:
             std_distance = (self.variance_distance / (self.n_distances - 1)) ** 0.5  # Desvio padrão
-            return self.mean_distance + 2.67 * std_distance  # Limiar dinâmico de dispersão
+            return self.mean_distance + 2.0 * std_distance  # Limiar dinâmico de dispersão
         else:
             return 1.0  # Valor inicial para garantir que algo seja retornado
 

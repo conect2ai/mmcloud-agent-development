@@ -78,7 +78,7 @@ class TEDA:
         "Run the algorithm online"""
     
         # calculate n from the length of the feature list
-        n = len(features)
+        n = 2.0
 
         # build the X sample numpy array
         x = np.array(features)

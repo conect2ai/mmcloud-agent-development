@@ -1,6 +1,6 @@
 # agents/schemas.py
 from dataclasses import dataclass, field
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
 
 @dataclass
 class Processed:
@@ -35,3 +35,4 @@ class OrchestratorOutput:
     policy: PolicyState
     alerts: List[Alert]
     message: str
+    metrics: Dict[str, Any] = field(default_factory=dict)
