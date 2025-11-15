@@ -208,3 +208,7 @@ __marimo__/
 
 # OS files
 .DS_Store
+
+# Folders
+/replays
+/trips
