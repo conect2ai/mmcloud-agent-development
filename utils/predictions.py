@@ -22,12 +22,12 @@ def predict_fuel_type(dados):
         return dados["fuel_type"], prob
     elif "ethanol_percentage" in dados:
         model = joblib.load("./models/ethanol_model_rf.pkl")
-        X = [dados["ethanol_percentage"],
+        X = [float(dados.get("ethanol_percentage",0.0)),
              dados["speed"],
              dados["rpm"],
              dados["engine_load"],
              dados["throttle"],
-             dados["timing_advance"]]
+             float(dados.get("timing_advance", 0.0))]
         X = np.array(X).reshape(1, -1)
         fuel_type = model.predict(X)[0]
         prob = model.predict_proba(X)[0]

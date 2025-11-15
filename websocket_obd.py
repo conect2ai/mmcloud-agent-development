@@ -52,6 +52,7 @@ MOCK_ACC = os.getenv("MOCK_ACC", "1") in {"1", "true", "True", "yes", "YES"}
 MOCK_GPS = os.getenv("MOCK_GPS", "1") in {"1", "true", "True", "yes", "YES"}
 TRIP_DIR = Path("data/trips")
 TRIP_DIR.mkdir(parents=True, exist_ok=True)
+COLLECTED_ROWS = 0
 
 TRIP_START_ISO = None      # ex.: '2025-10-21T11-03-27Z'
 TRIP_LOG_FILE = None       # Path to CSV of the current trip
@@ -66,11 +67,11 @@ GPS_PORT = os.getenv("GPS_PORT", "/dev/ttyAMA0")
 # liga o replay
 REPLAY_MODE=1
 # arquivo com os dados
-REPLAY_CSV="./replays/trip_log_eclipse_0.csv"
+REPLAY_CSV="./replays/trip_log_polo_branco_2.csv"
 # aceleração do tempo (2.0 = 2x, 0 = ignore timestamps e solta a cada SEND_INTERVAL_S)
 REPLAY_SPEED=1.0
 # reinicia quando terminar
-REPLAY_LOOP=1
+REPLAY_LOOP=0
 # “tempo” do replay: file=reproduz ritmo pelo timestamp; realtime=ignora ts e usa intervalo fixo
 REPLAY_CLOCK="file"   # ou realtime
 
@@ -107,24 +108,205 @@ mmcloud = MMCloud(dimension=2, max_clusters=3)
 # Data collectors
 # =========================
 
-def read_obd_snapshot() -> Dict[str, Any]:
+import os, time
+from typing import Dict, Any
+
+# --- Configuráveis por env (opcionais) ---
+OBD_PORT = os.getenv("OBD_PORT")           # ex.: "/dev/ttyUSB0" ou "/dev/rfcomm0"
+OBD_BAUD = int(os.getenv("OBD_BAUD", "0")) # 0 = auto
+OBD_FAST = os.getenv("OBD_FAST", "1") not in ("0", "false", "False")
+
+# Frequências (em segundos)
+FAST_INTERVAL = float(os.getenv("OBD_FAST_INTERVAL_S", "0.3"))   # rpm/speed/throttle/load
+SLOW_INTERVAL = float(os.getenv("OBD_SLOW_INTERVAL_S", "2.0"))   # temps, trims, etc.
+
+# Chaves críticas para a sua pipeline (sempre presentes com default 0.0)
+CRITICAL_KEYS = ("rpm", "speed", "throttle", "engine_load", "timing_advance", "ethanol_percentage", "intake_temp", "maf", "map")
+
+# Estado cacheado (evita re-descobrir tudo a cada chamada)
+__obd_conn = None
+__supported: Dict[str, Any] = {}
+__last_values: Dict[str, float] = {}
+__last_ts: Dict[str, float] = {}
+
+def __connect_obd():
+    """Cria (ou reutiliza) a conexão OBD."""
+    global __obd_conn
     import obd
-    connection = obd.OBD()
-    sensors = {
-        "speed": obd.commands.SPEED,
-        "rpm": obd.commands.RPM,
-        "engine_load": obd.commands.ENGINE_LOAD,
-        "coolant_temp": obd.commands.COOLANT_TEMP,
+    if __obd_conn and __obd_conn.is_connected():
+        return __obd_conn
+    try:
+        kw = {}
+        if OBD_PORT:
+            kw["portstr"] = OBD_PORT
+        if OBD_BAUD > 0:
+            kw["baudrate"] = OBD_BAUD
+        kw["fast"] = OBD_FAST
+        __obd_conn = obd.OBD(**kw)
+    except Exception:
+        # Tenta um fallback mais tolerante
+        try:
+            __obd_conn = obd.OBD(fast=False)
+        except Exception:
+            __obd_conn = None
+    return __obd_conn
+
+def __discover_supported(conn):
+    """Monta o dict de sensores suportados e cacheia."""
+    global __supported
+    if __supported:
+        return __supported
+    import obd
+    # Grupo rápido
+    sensors_fast = {
+        "speed":          obd.commands.SPEED,
+        "rpm":            obd.commands.RPM,
+        "throttle":       obd.commands.THROTTLE_POS,
+        "engine_load":    obd.commands.ENGINE_LOAD,
         "timing_advance": obd.commands.TIMING_ADVANCE,
-        "intake_temp": obd.commands.INTAKE_TEMP,
-        "maf": obd.commands.MAF,
-        "throttle": obd.commands.THROTTLE_POS,
-        "fuel_level": obd.commands.FUEL_LEVEL,
-        "ethanol_percentage": obd.commands.ETHANOL_PERCENT,
-        "tempAmbiente": obd.commands.AMBIANT_AIR_TEMP,
-        "bateria": obd.commands.CONTROL_MODULE_VOLTAGE,
-        "temperaturaMotor": obd.commands.COOLANT_TEMP,
+        "intake_temp":    obd.commands.INTAKE_TEMP,
     }
+    # Grupo lento
+    sensors_slow = {
+        "ethanol_percentage":getattr(obd.commands, "ETHANOL_PERCENT", 0.0),
+        "coolant_temp":        obd.commands.COOLANT_TEMP,
+        "maf":                 obd.commands.MAF,
+        "map":                 obd.commands.INTAKE_PRESSURE,
+        "baro":                obd.commands.BAROMETRIC_PRESSURE,
+        "fuel_level":          obd.commands.FUEL_LEVEL,
+        "air_fuel_ratio":      getattr(obd.commands, "AIR_FUEL_RATIO", None),
+        "o2_b1s1":             getattr(obd.commands, "O2_B1S1_VOLTAGE", None),
+        "battery_voltage":     obd.commands.CONTROL_MODULE_VOLTAGE,
+        "ambient_temp":        obd.commands.AMBIANT_AIR_TEMP,
+        "cat_temp1":           getattr(obd.commands, "CATALYST_TEMP_B1S1", None),
+        "oil_temp":            getattr(obd.commands, "OIL_TEMP", None),
+        "fuel_pressure":       getattr(obd.commands, "FUEL_PRESSURE", None),
+        "distance_since_clear":getattr(obd.commands, "DISTANCE_SINCE_DTC_CLEAR", None),
+    }
+    # Remove None (pode não existir em versões antigas da lib)
+    sensors_slow = {k:v for k,v in sensors_slow.items() if v is not None}
+    # Interseção com suportados pela ECU
+    try:
+        supported_cmds = conn.supported_commands
+        fast_ok = {k:v for k,v in sensors_fast.items() if v in supported_cmds}
+        slow_ok = {k:v for k,v in sensors_slow.items() if v in supported_cmds}
+    except Exception:
+        # Se não conseguir listar, tenta tudo mesmo assim
+        fast_ok, slow_ok = sensors_fast, sensors_slow
+    __supported = {"fast": fast_ok, "slow": slow_ok}
+    return __supported
+
+def __to_float(val) -> float:
+    """Converte objetos Unit/Ratio/String da python-OBD para float."""
+    try:
+        # objects com magnitude (pint)
+        mag = getattr(val, "magnitude", None)
+        if mag is not None:
+            return float(mag)
+        # às vezes é algo que já faz float(...)
+        return float(val)
+    except Exception:
+        # último recurso: parse do início da string
+        s = str(val)
+        try:
+            return float(s.split()[0].replace(",", "."))
+        except Exception:
+            return 0.0
+
+def __query(conn, cmd):
+    """Consulta um comando com tolerância a falhas."""
+    try:
+        resp = conn.query(cmd)
+        if resp is None or resp.value is None:
+            return None
+        return __to_float(resp.value)
+    except Exception:
+        return None
+
+def read_obd_snapshot() -> Dict[str, Any]:
+    """
+    Lê um snapshot OBD com:
+      - apenas PIDs suportados,
+      - cache por frequência (FAST_INTERVAL / SLOW_INTERVAL),
+      - sem quebrar se falhar algo (defaults em CRITICAL_KEYS).
+    """
+    global __last_values, __last_ts
+    now = time.monotonic()
+
+    conn = __connect_obd()
+    data: Dict[str, Any] = {}
+
+    if not conn or not conn.is_connected():
+        # Se não conectar, devolve valores anteriores (se houver) + defaults
+        for k in set(__last_values.keys()) | set(CRITICAL_KEYS):
+            data[k] = float(__last_values.get(k, 0.0))
+        return data
+
+    groups = __discover_supported(conn)
+
+    # FAST group (sempre tenta dentro do intervalo)
+    for key, cmd in groups["fast"].items():
+        last_t = __last_ts.get(key, 0.0)
+        if now - last_t >= FAST_INTERVAL or key not in __last_values:
+            val = __query(conn, cmd)
+            if val is not None:
+                __last_values[key] = val
+                __last_ts[key] = now
+        data[key] = float(__last_values.get(key, 0.0))
+
+    # SLOW group (só atualiza quando interval expirar)
+    for key, cmd in groups["slow"].items():
+        last_t = __last_ts.get(key, 0.0)
+        if now - last_t >= SLOW_INTERVAL or key not in __last_values:
+            val = __query(conn, cmd)
+            if val is not None:
+                __last_values[key] = val
+                __last_ts[key] = now
+        if key in __last_values:
+            data[key] = float(__last_values[key])
+
+    # Garantias mínimas p/ sua pipeline
+    for k in CRITICAL_KEYS:
+        data.setdefault(k, 0.0)
+
+    # (Opcional) aliases amigáveis, se quiser manter compatibilidade com sua UI
+    # data["bateria"] = data.get("battery_voltage", data.get("bateria", 0.0))
+    # data["temperaturaMotor"] = data.get("coolant_temp", data.get("temperaturaMotor", 0.0))
+
+    # print(data)  # debug
+    return data
+
+# def read_obd_snapshot() -> Dict[str, Any]:
+#     import obd
+#     connection = obd.OBD()
+#     sensors = {
+#         "speed": obd.commands.SPEED,
+#         "rpm": obd.commands.RPM,
+#         "engine_load": obd.commands.ENGINE_LOAD,
+#         "coolant_temp": obd.commands.COOLANT_TEMP,
+#         "timing_advance": obd.commands.TIMING_ADVANCE,
+#         "intake_temp": obd.commands.INTAKE_TEMP,
+#         "maf": obd.commands.MAF,
+#         "throttle": obd.commands.THROTTLE_POS,
+#         "fuel_level": obd.commands.FUEL_LEVEL,
+#         "ethanol_percentage": obd.commands.ETHANOL_PERCENT,
+#         "tempAmbiente": obd.commands.AMBIANT_AIR_TEMP,
+#         "bateria": obd.commands.CONTROL_MODULE_VOLTAGE,
+#         "temperaturaMotor": obd.commands.COOLANT_TEMP,
+#     }
+
+#     latest_data = {}
+    
+#     for key, cmd in sensors.items():
+#         response = connection.query(cmd)
+#         if response and response.value is not None:
+#             try:
+#                 latest_data[key] = float(str(response.value).split(" ")[0])
+#             except:
+#                 pass
+    
+    # print(latest_data)
+    # return latest_data
     
 def read_test_snapshot() -> Dict[str, Any]:
     return {
@@ -221,10 +403,10 @@ def build_payload_interface(raw) -> Dict[str, Any]:
 
     bateria            = safe_round(get_first(raw, "battery", "battery_voltage", "bateria"), 13, 2)
     temperatura_motor  = safe_int(get_first(raw, "engine_temp", "coolant_temp", "temperaturaMotor"), 90)
-    tipo_combustivel   = get_first(raw, "fuel_type", "fuel", "tipoCombustivel", default="Gasolina")
-    tipo_via           = get_first(raw, "road_type", "tipoVia", "city_highway", default="Desconhecida")
+    tipo_combustivel   = get_first(raw, "fuel_type", "fuel", default="Gasoline")
+    tipo_via           = get_first(raw, "road_type", "city_highway", "tipoVia", default="Desconhecida")
     co2_val            = safe_round(get_first(raw, "co2", "co2_emission_per_km"), 200, 2)
-    perfil_motorista   = get_first(raw, "driver_profile", "driver_behavior", "perfilMotorista", default="Calmo")
+    perfil_motorista   = get_first(raw, "driver_profile", "driver_behavior", "perfilMotorista", default="Normal")
     velocidade         = safe_int(get_first(raw, "speed", "velocidade"), 60)
     fuel_level         = safe_int(get_first(raw, "fuel_level", "fuelLevel"), 50)
     eco_mode           = bool(get_first(raw, "eco_mode", "eco", default=False))
@@ -462,11 +644,13 @@ def compute_features_and_predictions(raw, rec: RowMetrics | None = None):
     
     # 1. Calculate radar area
     raw['radar_area'] = calculate_radar_area({
-        "rpm": raw["rpm"],
-        "speed": raw["speed"],
-        "throttle": raw["throttle"],
-        "engine_load": raw["engine_load"]
+        "rpm": float(raw.get("rpm", 0.0)),
+        "speed": float(raw.get("speed", 0.0)),
+        "throttle": float(raw.get("throttle", 0.0)),
+        "engine_load": float(raw.get("engine_load", 0.0)),
     })
+
+    # print(raw['radar_area'])
 
     # 2. Run TEDA model on radar area soft-sensor
     with rec.block("teda.run"):
@@ -474,11 +658,13 @@ def compute_features_and_predictions(raw, rec: RowMetrics | None = None):
 
     # 3. Run MMCloud to identify the driver profile
     with rec.block("mmcloud.process_point"):
-        raw["driver_behavior"] = mmcloud.process_point([raw["radar_area"], raw["engine_load"]], 1)
+        raw["driver_behavior"] = mmcloud.process_point(COLLECTED_ROWS, [raw["radar_area"], raw["engine_load"]])
 
     # 4. Identify fuel type (Gasoline or Ethanol)
     with rec.block("rf.fuel_type"):
         raw["fuel_type"], raw["fuel_type_prob"] = predict_fuel_type(raw)
+
+    # print(raw["fuel_type"])
 
     # 5.1 Get the accelerometer data and calculate the magnitude
     if MOCK_ACC:
@@ -626,15 +812,21 @@ async def _startup():
         )
         # 2) tenta descobrir/cachear o PID (sem quebrar se não achar)
         try:
-            from utils.proc_utils import ensure_llm_pid
-            pid = ensure_llm_pid(LLM, default_port=8080, attempts=6, sleep_s=0.3)
-            print(f"[startup] LLM.monitor_pid = {pid}")
+            from utils.proc_utils import find_llama_server_pid
+
+            pid = None
+            for _ in range(6):
+                pid = find_llama_server_pid(getattr(LLM, "base_url", None), default_port=8080)
+                if pid:
+                    break
+                time.sleep(0.3)
         except Exception as e:
             print(f"[startup] ensure_llm_pid erro: {e}")
     else:
         LLM = None
         print("[startup] LLM indisponível (server não respondeu). Seguindo sem métricas do LLM.")
 
+    # LLM=None
     # ---- Orquestrador ----
     ORCH = Orchestrator(llm=LLM)
 

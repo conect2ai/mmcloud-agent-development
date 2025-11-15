@@ -1,68 +1,107 @@
 # agents/advise_agent.py
-import httpx
 from typing import List, Tuple, Dict, Any
 from agents.schemas import PolicyState, Alert
-from utils.proc_utils import sample_process_metrics, find_llama_server_pid
 
-DEFAULT_FALLBACK = "OK. Keeping an eye on the route. I will notify you if I detect nearby incidents or fines."
+DEFAULT_FALLBACK = (
+    "Behavior: Normal. PRF zone: none. Driving is within expected range. Stay attentive."
+)
 
-async def advise_agent(policy: PolicyState, alerts: List[Alert], llm) -> Tuple[str, str, Dict[str, Any]]:
+SYSTEM_PROMPT = (
+    "You are in-car assistant."
+    "Start with: 'Behavior: {behavior}. PRF zone: {risk}.' "
+    "Be concise. No extra disclaimers. One short tip."
+    # "Rewrite the draft with different words."
+)
+
+
+def _risk_label(alerts: List[Alert]) -> str:
     """
-    Returns (message, source, meta)
-      - source in {"model","fallback","timeout","error"}
-      - meta: {"usage": {...}, "timings": {...}, "proc": {...}, "metrics_source": "..."} (may be empty)
+    Returns one of: 'none', 'accidents', 'fines', or 'accidents and fines'.
+    Separation is based on the Alert.type field ('accident' | 'fine').
+    If both types are present at once, we report 'accidents and fines'.
     """
-    system = (
-        "You are an in-car assistant. Be brief (<= 2 sentences). "
-        "Use neutral, helpful tone. If there is any nearby incident/fine, mention distance and advice."
-    )
+    if not alerts: return "none"
+    has_acc = any(a.type == "accident" for a in alerts)
+    has_fin = any(a.type == "fine" for a in alerts)
+    if has_acc and has_fin: return "accidents and fines"
+    if has_acc: return "accidents"
+    if has_fin: return "fines"
+    return "none"
 
-    bh = policy.behavior
-    sev = policy.severity
-    reason = ", ".join(getattr(policy, "reasons", []) or []) or "n/a"
-    if alerts:
-        a = alerts[0]
-        al = f"{a.type} ~{a.distance_m} m {a.direction}"
-    else:
-        al = "none"
+def _rule_draft(policy: PolicyState, alerts: List[Alert]) -> str:
+    """
+    Build a short English draft combining behavior + PRF zone.
+    Keep this minimal; the LLM will refine.
+    """
+    beh = (policy.behavior or "Normal").capitalize()
+    risk = _risk_label(alerts)
+    if beh.lower()=="aggressive" and risk!="none":
+        return "Aggressive driving in a risk zone. Slow down and increase space."
+    if beh.lower()=="aggressive":
+        return "Aggressive driving. Ease off throttle and avoid harsh braking."
+    if beh.lower()=="cautious" and risk!="none":
+        return "Cautious driving in a risk zone. Keep attention; good for safety and economy."
+    if beh.lower()=="cautious":
+        return "Cautious driving—good for safety and fuel economy."
+    # Normal
+    if risk!="none": return "Risk zone ahead. Stay alert and adjust speed."
+    return "Driving within expected range. Maintain defensive driving."
 
-    user = (
-        f"Driver behavior: {bh} (severity: {sev}). Reasons: {reason}.\n"
-        f"Nearby alerts: {al}.\n"
-        "Give one short advice line to the driver."
-    )
+def _ensure_labels(text: str, behavior: str, risk: str) -> str:
+    """
+    Guarantee the output begins with:
+      'Behavior: <Cautious|Normal|Aggressive>. PRF zone: <none|accidents|fines|accidents and fines>.'
+    If missing, prepend those labels.
+    """
+    text = (text or "").strip()
+    prefix = f"Behavior: {behavior}. PRF zone: {risk}."
+    low = text.lower()
+    if "behavior:" in low and "prf zone:" in low:
+        return text
+    return f"{prefix} {text}".strip()
+
+def _sanitize_ascii(s: str) -> str:
+    try:
+        return s.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return s  # fallback silencioso
+
+
+async def advise_agent(
+    policy: PolicyState,
+    alerts: List[Alert],
+    llm
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Returns (message, source, meta):
+      - message: final English text, max ~2 sentences, with explicit labels
+      - source: "model" | "fallback"
+      - meta: may include usage/timings/proc if LLMRuntimeOpenAI provides it
+    """
+    behavior = (policy.behavior or "Normal").capitalize()
+    risk = _risk_label(alerts)
+    draft = _rule_draft(policy, alerts)
 
     if llm is None:
-        return DEFAULT_FALLBACK, "fallback", {}
+        return _ensure_labels(draft, behavior, risk), "fallback", {}
+
+    # ---- PROMPT ----
+    system = SYSTEM_PROMPT.format(behavior=behavior, risk=risk)
+    user = (
+        f"Fraft: {draft}\n"
+        f"Severity: {policy.severity or 'low'}."
+        + (f" Alert: {alerts[0].type} ~{alerts[0].distance_m}m {alerts[0].direction}." if alerts else "")
+    )
+
+    system = _sanitize_ascii(system)
+    user = _sanitize_ascii(user)
 
     try:
-        out = await llm.chat(system, user)  # expected: {"message": str, "meta": {...}}
+        out = await llm.chat(system, user)  # {"message": str, "meta": {...}}
         text = (out.get("message") or "").strip()
-        meta: Dict[str, Any] = dict(out.get("meta") or {})
-
-        # ---- attach process metrics (server) ----
-        proc = {}
-        pid = getattr(llm, "monitor_pid", None)
-        if not pid:
-            pid = find_llama_server_pid(getattr(llm, "base_url", None), default_port=8080)
-            try:
-                setattr(llm, "monitor_pid", pid)
-            except Exception:
-                pass
-        if pid:
-            try:
-                proc = sample_process_metrics(pid)
-            except Exception:
-                proc = {}
-
-        meta["proc"] = proc
-        meta.setdefault("metrics_source", "server+client")
-
+        meta = out.get("meta") or {}
         if not text:
-            return DEFAULT_FALLBACK, "error", meta
-        return text, "model", meta
-
-    except httpx.TimeoutException:
-        return DEFAULT_FALLBACK, "timeout", {}
+            text = draft
+        return _ensure_labels(text, behavior, risk), "model", meta
     except Exception:
-        return DEFAULT_FALLBACK, "error", {}
+        return _ensure_labels(draft, behavior, risk), "fallback", {}
