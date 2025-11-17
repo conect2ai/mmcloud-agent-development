@@ -76,16 +76,25 @@ async def advise_agent(
     Returns (message, source, meta):
       - message: final English text, max ~2 sentences, with explicit labels
       - source: "model" | "fallback"
-      - meta: may include usage/timings/proc if LLMRuntimeOpenAI provides it
+      - meta: may include usage/timings/proc + agent_inserted_behavior_prf
     """
     behavior = (policy.behavior or "Normal").capitalize()
     risk = _risk_label(alerts)
     draft = _rule_draft(policy, alerts)
 
+    # -----------------------------
+    # CASE 1: Fallback (sem LLM)
+    # -----------------------------
     if llm is None:
-        return _ensure_labels(draft, behavior, risk), "fallback", {}
+        final_text = _ensure_labels(draft, behavior, risk)
+        meta = {
+            "agent_inserted_behavior_prf": True  # sempre true no fallback
+        }
+        return final_text, "fallback", meta
 
-    # ---- PROMPT ----
+    # -----------------------------
+    # CASE 2: Com LLM
+    # -----------------------------
     system = SYSTEM_PROMPT.format(behavior=behavior, risk=risk)
     user = (
         f"Fraft: {draft}\n"
@@ -98,10 +107,38 @@ async def advise_agent(
 
     try:
         out = await llm.chat(system, user)  # {"message": str, "meta": {...}}
+
         text = (out.get("message") or "").strip()
         meta = out.get("meta") or {}
+
         if not text:
             text = draft
-        return _ensure_labels(text, behavior, risk), "model", meta
+
+        # -----------------------------------------------
+        # NEW: Detecta se o LLM incluiu Behavior/PRF zone
+        # -----------------------------------------------
+        low = text.lower()
+        has_behavior = "behavior:" in low
+        has_prf = "prf zone" in low
+
+        if has_behavior and has_prf:
+            # LLM gerou espontaneamente as labels
+            inserted = False
+            final_text = text
+        else:
+            # Agente precisou forçar via _ensure_labels()
+            inserted = True
+            final_text = _ensure_labels(text, behavior, risk)
+
+        # Marca explicitamente no meta
+        meta["agent_inserted_behavior_prf"] = inserted
+
+        return final_text, "model", meta
+
     except Exception:
-        return _ensure_labels(draft, behavior, risk), "fallback", {}
+        # Fallback em caso de erro do LLM
+        final_text = _ensure_labels(draft, behavior, risk)
+        meta = {
+            "agent_inserted_behavior_prf": True
+        }
+        return final_text, "fallback", meta
